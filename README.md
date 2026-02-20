@@ -22,4 +22,4 @@ go version go1.26.0-X:nodwarf5 linux/amd64
 Для тестирования используется скрипт `./scripts/tests.sh`
 
 ## Контакт
-[nikishefu](https://github.com/nikishefu)
+GitHub: [nikishefu](https://github.com/nikishefu)
