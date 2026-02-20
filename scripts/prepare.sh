@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Checking required environment variables"
-: "${POSTGRES_HOST:?Need POSTGRES_HOST}"
-: "${POSTGRES_PORT:?Need POSTGRES_PORT}"
-: "${POSTGRES_DB:?Need POSTGRES_DB}"
-: "${POSTGRES_USER:?Need POSTGRES_USER}"
-: "${POSTGRES_PASSWORD:?Need POSTGRES_PASSWORD}"
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=project-sem-1
+POSTGRES_USER=validator
+POSTGRES_PASSWORD=val1dat0r
 
 go mod tidy
 go build -o app .
