@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -35,55 +36,67 @@ func NewPriceRepository(db *sql.DB) *PriceRepository {
 	return &PriceRepository{db: db}
 }
 
-func (r *PriceRepository) BatchInsert(ctx context.Context, prices []Price) error {
+func (r *PriceRepository) BatchInsert(ctx context.Context, prices []Price) (int, int, float64, error) {
+	var total_items, cats int
+	var total_price float64
+
 	if len(prices) == 0 {
-		return nil
+		err := r.db.QueryRowContext(ctx,
+			`SELECT COUNT(DISTINCT category), COALESCE(SUM(price),0) FROM prices`,
+		).Scan(&cats, &total_price)
+		return 0, cats, total_price, err
 	}
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return total_items, cats, total_price, err
 	}
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO prices(id,name,category,price,create_date)
-		 VALUES ($1,$2,$3,$4,$5)
-		 ON CONFLICT (id) DO UPDATE SET
-			name = EXCLUDED.name,
-			category = EXCLUDED.category,
-			price = EXCLUDED.price,
-			create_date = EXCLUDED.create_date`)
+		`INSERT INTO prices(name,category,price,create_date)
+		 VALUES ($1,$2,$3,$4)`)
 	if err != nil {
-		return err
+		return total_items, cats, total_price, err
 	}
 	defer stmt.Close()
 
 	for _, p := range prices {
 		if _, err := stmt.ExecContext(ctx,
-			p.ID, p.Name, p.Category, p.Price, p.CreateDate,
+			p.Name, p.Category, p.Price, p.CreateDate,
 		); err != nil {
-			return err
+			return total_items, cats, total_price, err
 		}
+		total_items++
 	}
 
-	return tx.Commit()
+	err = tx.QueryRowContext(ctx,
+		`SELECT COUNT(DISTINCT category), COALESCE(SUM(price),0) FROM prices`,
+	).Scan(&cats, &total_price)
+	if err != nil {
+		return total_items, cats, total_price, err
+	}
+
+	return total_items, cats, total_price, tx.Commit()
 }
 
-func (r *PriceRepository) StreamAll(ctx context.Context) (*sql.Rows, error) {
-	return r.db.QueryContext(ctx,
+func (r *PriceRepository) ReadAll(ctx context.Context) ([]Price, error) {
+	rows, err := r.db.QueryContext(ctx,
 		`SELECT id,name,category,price,create_date FROM prices ORDER BY id`)
-}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 
-func (r *PriceRepository) Stats(ctx context.Context) (int, int, float64, error) {
-	var items, categories int
-	var total float64
-
-	err := r.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COUNT(DISTINCT category), COALESCE(SUM(price),0) FROM prices`,
-	).Scan(&items, &categories, &total)
-
-	return items, categories, total, err
+	var res []Price
+	for rows.Next() {
+		var p Price
+		if err := rows.Scan(&p.ID, &p.Name, &p.Category, &p.Price, &p.CreateDate); err != nil {
+			return nil, err
+		}
+		res = append(res, p)
+	}
+	return res, rows.Err()
 }
 
 type PriceService struct{ repo *PriceRepository }
@@ -135,51 +148,49 @@ func (s *PriceService) ImportZip(ctx context.Context, r io.ReaderAt, size int64)
 		rc.Close()
 	}
 
-	if err := s.repo.BatchInsert(ctx, batch); err != nil {
-		return nil, err
-	}
-
-	items, cats, total, err := s.repo.Stats(ctx)
+	total_items, cats, total_price, err := s.repo.BatchInsert(ctx, batch)
 	if err != nil {
 		return nil, err
 	}
 
 	return map[string]any{
-		"total_items":      items,
+		"total_items":      total_items,
 		"total_categories": cats,
-		"total_price":      total,
+		"total_price":      total_price,
 	}, nil
 }
 
 func (s *PriceService) ExportZip(ctx context.Context, w io.Writer) error {
-	rows, err := s.repo.StreamAll(ctx)
+	data, err := s.repo.ReadAll(ctx)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
 	zw := zip.NewWriter(w)
-	f, _ := zw.Create("data.csv")
+	f, err := zw.Create("data.csv")
+	if err != nil {
+		return err
+	}
+
 	cw := csv.NewWriter(f)
+	if err := cw.Write([]string{"id", "name", "category", "price", "create_date"}); err != nil {
+		return err
+	}
 
-	cw.Write([]string{"id", "name", "category", "price", "create_date"})
-
-	for rows.Next() {
-		var p Price
-		if err := rows.Scan(&p.ID, &p.Name, &p.Category, &p.Price, &p.CreateDate); err != nil {
-			return err
-		}
-		cw.Write([]string{
+	for _, p := range data {
+		if err := cw.Write([]string{
 			strconv.Itoa(p.ID),
 			p.Name,
 			p.Category,
 			strconv.FormatFloat(p.Price, 'f', -1, 64),
 			p.CreateDate,
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	cw.Flush()
-	if err := rows.Err(); err != nil {
+	if err := cw.Error(); err != nil {
 		return err
 	}
 
@@ -191,28 +202,27 @@ type Handler struct{ svc *PriceService }
 func NewHandler(s *PriceService) *Handler { return &Handler{svc: s} }
 
 func (h *Handler) PostPrices(w http.ResponseWriter, r *http.Request) {
-	tmpFile, err := os.CreateTemp("", "upload-*.zip")
-	if err != nil {
-		http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
-		return
-	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
+	defer r.Body.Close()
 
-	size, err := io.Copy(tmpFile, r.Body)
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "Failed to save upload", http.StatusInternalServerError)
+		http.Error(w, "Failed to read upload", http.StatusInternalServerError)
 		return
 	}
 
-	res, err := h.svc.ImportZip(r.Context(), tmpFile, size)
+	reader := bytes.NewReader(data)
+
+	res, err := h.svc.ImportZip(r.Context(), reader, int64(len(data)))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res)
+
+	if err := json.NewEncoder(w).Encode(res); err != nil {
+		log.Printf("Error: failed to write response: %v", err)
+	}
 }
 
 func (h *Handler) GetPrices(w http.ResponseWriter, r *http.Request) {
@@ -247,26 +257,32 @@ func openDB() (*sql.DB, error) {
 func ensureSchema(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, `
 	CREATE TABLE IF NOT EXISTS prices (
-		id INT PRIMARY KEY,
-		name TEXT,
-		category TEXT,
-		price NUMERIC,
-		create_date DATE
+		id SERIAL PRIMARY KEY,
+		name VARCHAR(255) NOT NULL,
+		category VARCHAR(255) NOT NULL,
+		price DECIMAL(10,2) NOT NULL,
+		create_date TIMESTAMP NOT NULL
 	);`)
 	return err
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	db, err := openDB()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer db.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := ensureSchema(ctx, db); err != nil {
 		cancel()
-		log.Fatal(err)
+		return err
 	}
 	cancel()
 
@@ -291,24 +307,32 @@ func main() {
 		Handler: mux,
 	}
 
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	errCh := make(chan error, 1)
+
 	go func() {
 		log.Println("Server listening on :8080")
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("listen: %s\n", err)
+			errCh <- err
 		}
 	}()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("Shutting down server...")
+	select {
+	case <-quit:
+		log.Println("Shutting down server...")
+	case err := <-errCh:
+		return err
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatal("Server forced to shutdown:", err)
+		return err
 	}
 
 	log.Println("Server exiting")
+	return nil
 }
